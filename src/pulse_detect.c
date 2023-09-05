@@ -16,11 +16,13 @@
 #include "baseband.h"
 #include "dc_blocker.h"
 #include "median_filter.h"
+#include "peak_follower.h"
 #include "util.h"
 #include "logger.h"
 #include "fatal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 // OOK adaptive level estimator constants
 #define OOK_MAX_HIGH_LEVEL  DB_TO_AMP(0)   // Maximum estimate for high level (-0 dB)
@@ -55,6 +57,8 @@ struct pulse_detect {
     pulse_detect_fsk_t pulse_detect_fsk;
     dc_blocker_t *dc_blocker;
     median_filter_t *median_filter;
+    peak_follower_t *peak_follower;
+    int use_peak_follower;
 };
 
 pulse_detect_t *pulse_detect_create(void)
@@ -69,6 +73,8 @@ pulse_detect_t *pulse_detect_create(void)
 
     pulse_detect->dc_blocker = dc_blocker_create(1024);
     pulse_detect->median_filter = median_filter_create(51);
+    pulse_detect->peak_follower = peak_follower_create(0.05, 0.99999, -25);
+    pulse_detect->use_peak_follower = 1;
     return pulse_detect;
 }
 
@@ -76,6 +82,7 @@ void pulse_detect_free(pulse_detect_t *pulse_detect)
 {
     dc_blocker_destroy(&(pulse_detect->dc_blocker));
     median_filter_destroy(&(pulse_detect->median_filter));
+    peak_follower_destroy(&(pulse_detect->peak_follower));
     free(pulse_detect);
 }
 
@@ -219,16 +226,35 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
             int att = pulse_detect->use_mag_est ? mag_to_att(am_n) : amp_to_att(am_n);
             att_hist[att] += 1;
         }
-        int16_t ook_threshold = (s->ook_low_estimate + s->ook_high_estimate) / 2;
-        if (pulse_detect->ook_fixed_high_level != 0) {
-            ook_threshold = pulse_detect->ook_fixed_high_level; // Manual override
+
+        int16_t ook_threshold_hi;
+        int16_t ook_threshold_lo;
+
+        if (pulse_detect->use_peak_follower) {
+            // pass input sample to the peak follower
+            int16_t ook_threshold = peak_follower_process(pulse_detect->peak_follower, am_n);
+
+            // if we got zero threshold it means there is no valid signal detected
+            if (!ook_threshold) {
+                am_n = 0;
+            }
+
+            ook_threshold_hi = ook_threshold / 4 + ook_threshold / 6;
+            ook_threshold_lo = ook_threshold / 8 - ook_threshold / 6;
+        } else {
+            int16_t ook_threshold = (s->ook_low_estimate + s->ook_high_estimate) / 2;
+            if (pulse_detect->ook_fixed_high_level != 0) {
+                ook_threshold = pulse_detect->ook_fixed_high_level; // Manual override
+            }
+            int16_t const ook_hysteresis = ook_threshold / 8; // +-12%
+            ook_threshold_hi = ook_threshold + ook_hysteresis;
+            ook_threshold_lo = ook_threshold - ook_hysteresis;
         }
-        int16_t const ook_hysteresis = ook_threshold / 8; // +-12%
 
         // OOK State machine
         switch (s->ook_state) {
             case PD_OOK_STATE_IDLE:
-                if (am_n > (ook_threshold + ook_hysteresis)    // Above threshold?
+                if (am_n > (ook_threshold_hi)    // Above threshold?
                         && s->lead_in_counter > OOK_EST_LOW_RATIO) { // Lead in counter to stabilize noise estimate
                     // Initialize all data
                     pulse_data_clear(pulses);
@@ -259,7 +285,7 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
             case PD_OOK_STATE_PULSE:
                 s->pulse_length += 1;
                 // End of pulse detected?
-                if (am_n < (ook_threshold - ook_hysteresis)) {    // Gap?
+                if (am_n < (ook_threshold_lo)) {    // Gap?
                     // Check for spurious short pulses
                     if (s->pulse_length < PD_MIN_PULSE_SAMPLES) {
                         if (pulses->num_pulses <= 1) {
@@ -300,7 +326,7 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
             case PD_OOK_STATE_GAP_START:    // Beginning of gap - it might be a spurious gap
                 s->pulse_length += 1;
                 // Pulse detected again already? (This is a spurious short gap)
-                if (am_n > (ook_threshold + ook_hysteresis)) {    // New pulse?
+                if (am_n > (ook_threshold_hi)) {    // New pulse?
                     s->pulse_length += pulses->pulse[pulses->num_pulses];    // Restore counter
                     s->ook_state = PD_OOK_STATE_PULSE;
                 }
@@ -324,11 +350,10 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
                             print_att_hist("PULSE_DATA_FSK", att_hist);
                         }
                         if (pulse_detect->verbosity >= LOG_NOTICE) {
-                            fprintf(stderr, "Levels low: -%d dB  high: -%d dB  thres: -%d dB  hyst: (-%d to -%d dB)\n",
+                            fprintf(stderr, "Levels low: -%d dB  high: -%d dB  thres_lo: -%d dB  thres_hi: -%d dB\n",
                                     mag_to_att(s->ook_low_estimate), mag_to_att(s->ook_high_estimate),
-                                    mag_to_att(ook_threshold),
-                                    mag_to_att(ook_threshold + ook_hysteresis),
-                                    mag_to_att(ook_threshold - ook_hysteresis));
+                                    mag_to_att(ook_threshold_hi),
+                                    mag_to_att(ook_threshold_lo));
                         }
                         return PULSE_DATA_FSK;
                     }
@@ -345,7 +370,7 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
             case PD_OOK_STATE_GAP:
                 s->pulse_length += 1;
                 // New pulse detected?
-                if (am_n > (ook_threshold + ook_hysteresis)) {    // New pulse?
+                if (am_n > (ook_threshold_hi)) {    // New pulse?
                     pulses->gap[pulses->num_pulses] = s->pulse_length;    // Store gap width
                     pulses->num_pulses += 1;    // Next pulse
 
@@ -382,11 +407,10 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
                         print_att_hist("PULSE_DATA_OOK EOP", att_hist);
                     }
                     if (pulse_detect->verbosity >= LOG_NOTICE) {
-                        fprintf(stderr, "Levels low: -%d dB  high: -%d dB  thres: -%d dB  hyst: (-%d to -%d dB)\n",
+                        fprintf(stderr, "Levels low: -%d dB  high: -%d dB  thres_lo: -%d dB  thres_hi: -%d dB\n",
                                 mag_to_att(s->ook_low_estimate), mag_to_att(s->ook_high_estimate),
-                                mag_to_att(ook_threshold),
-                                mag_to_att(ook_threshold + ook_hysteresis),
-                                mag_to_att(ook_threshold - ook_hysteresis));
+                                mag_to_att(ook_threshold_hi),
+                                mag_to_att(ook_threshold_lo));
                     }
                     return PULSE_DATA_OOK;    // End Of Package!!
                 }
