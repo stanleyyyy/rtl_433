@@ -14,6 +14,7 @@ add_library(r_433 STATIC
     confparse.c
     data.c
     data_tag.c
+    dc_blocker.c
     decoder_util.c
     fileformat.c
     http_server.c
