@@ -21,6 +21,7 @@ add_library(r_433 STATIC
     jsmn.c
     list.c
     logger.c
+    median_filter.c
     mongoose.c
     optparse.c
     output_file.c
