@@ -31,6 +31,7 @@ add_library(r_433 STATIC
     output_rtltcp.c
     output_trigger.c
     output_udp.c
+    peak_follower.c
     pulse_analyzer.c
     pulse_data.c
     pulse_detect.c
