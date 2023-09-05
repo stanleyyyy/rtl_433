@@ -14,6 +14,8 @@
 #include "pulse_detect_fsk.h"
 #include "pulse_data.h"
 #include "baseband.h"
+#include "dc_blocker.h"
+#include "median_filter.h"
 #include "util.h"
 #include "logger.h"
 #include "fatal.h"
@@ -51,6 +53,8 @@ struct pulse_detect {
     int verbosity; ///< Debug output verbosity, 0=None, 1=Levels, 2=Histograms
 
     pulse_detect_fsk_t pulse_detect_fsk;
+    dc_blocker_t *dc_blocker;
+    median_filter_t *median_filter;
 };
 
 pulse_detect_t *pulse_detect_create(void)
@@ -63,11 +67,15 @@ pulse_detect_t *pulse_detect_create(void)
 
     pulse_detect_set_levels(pulse_detect, 0, 0.0, -12.1442, 9.0, 0);
 
+    pulse_detect->dc_blocker = dc_blocker_create(1024);
+    pulse_detect->median_filter = median_filter_create(51);
     return pulse_detect;
 }
 
 void pulse_detect_free(pulse_detect_t *pulse_detect)
 {
+    dc_blocker_destroy(&(pulse_detect->dc_blocker));
+    median_filter_destroy(&(pulse_detect->median_filter));
     free(pulse_detect);
 }
 
@@ -200,8 +208,13 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
     int eop_on_spurious = 0;
     // Process all new samples
     while (s->data_counter < len) {
+        // remove any DC offset from the input signal
+        int16_t filtered_sample = dc_blocker_filter(pulse_detect->dc_blocker, envelope_data[s->data_counter]);
+
+        // apply median filtering
+        int16_t am_n = median_filter_process(pulse_detect->median_filter, filtered_sample);
+
         // Calculate OOK detection threshold and hysteresis
-        int16_t const am_n    = envelope_data[s->data_counter];
         if (pulse_detect->verbosity >= LOG_NOTICE) {
             int att = pulse_detect->use_mag_est ? mag_to_att(am_n) : amp_to_att(am_n);
             att_hist[att] += 1;
