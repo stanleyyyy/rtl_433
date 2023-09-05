@@ -45,6 +45,7 @@ add_library(r_433 STATIC
     sdr.c
     term_ctl.c
     util.c
+    wav_dumper.c
     write_sigrok.c
     devices/abmt.c
     devices/acurite.c
