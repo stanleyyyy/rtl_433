@@ -14,7 +14,6 @@
 #include "pulse_detect_fsk.h"
 #include "pulse_data.h"
 #include "baseband.h"
-#include "dc_blocker.h"
 #include "median_filter.h"
 #include "peak_follower.h"
 #include "util.h"
@@ -29,6 +28,7 @@
 #define OOK_MAX_LOW_LEVEL   DB_TO_AMP(-15) // Maximum estimate for low level
 #define OOK_EST_HIGH_RATIO  64          // Constant for slowness of OOK high level estimator
 #define OOK_EST_LOW_RATIO   1024        // Constant for slowness of OOK low level (noise) estimator (very slow)
+#define MIN_DB              -20         // minimum accepted signal strength in peak follower in dB. If this is set too low, decoder may pick up too much noise which prevents FSK decoder from lock-on
 
 /// Internal state data for pulse_pulse_package()
 struct pulse_detect {
@@ -55,9 +55,9 @@ struct pulse_detect {
     int verbosity; ///< Debug output verbosity, 0=None, 1=Levels, 2=Histograms
 
     pulse_detect_fsk_t pulse_detect_fsk;
-    dc_blocker_t *dc_blocker;
     median_filter_t *median_filter;
     peak_follower_t *peak_follower;
+    peak_follower_t *peak_follower_fm;
     int use_peak_follower;
 };
 
@@ -71,18 +71,18 @@ pulse_detect_t *pulse_detect_create(void)
 
     pulse_detect_set_levels(pulse_detect, 0, 0.0, -12.1442, 9.0, 0);
 
-    pulse_detect->dc_blocker = dc_blocker_create(1024);
-    pulse_detect->median_filter = median_filter_create(51);
-    pulse_detect->peak_follower = peak_follower_create(0.05, 0.99999, -25);
+    pulse_detect->median_filter = median_filter_create(15);
+    pulse_detect->peak_follower = peak_follower_create(0.05, 0.99999, MIN_DB);
+    pulse_detect->peak_follower_fm = peak_follower_create(0.05, 0.99999, MIN_DB);
     pulse_detect->use_peak_follower = 1;
     return pulse_detect;
 }
 
 void pulse_detect_free(pulse_detect_t *pulse_detect)
 {
-    dc_blocker_destroy(&(pulse_detect->dc_blocker));
     median_filter_destroy(&(pulse_detect->median_filter));
     peak_follower_destroy(&(pulse_detect->peak_follower));
+    peak_follower_destroy(&(pulse_detect->peak_follower_fm));
     free(pulse_detect);
 }
 
@@ -215,11 +215,11 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
     int eop_on_spurious = 0;
     // Process all new samples
     while (s->data_counter < len) {
-        // remove any DC offset from the input signal
-        int16_t filtered_sample = dc_blocker_filter(pulse_detect->dc_blocker, envelope_data[s->data_counter]);
+        // apply median filtering to AM demodulated data
+        int16_t am_n = median_filter_process(pulse_detect->median_filter, envelope_data[s->data_counter]);
 
-        // apply median filtering
-        int16_t am_n = median_filter_process(pulse_detect->median_filter, filtered_sample);
+        // get one FM demodulated sample
+        int16_t fm_n = fm_data[s->data_counter];
 
         // Calculate OOK detection threshold and hysteresis
         if (pulse_detect->verbosity >= LOG_NOTICE) {
@@ -227,20 +227,51 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
             att_hist[att] += 1;
         }
 
-        int16_t ook_threshold_hi;
-        int16_t ook_threshold_lo;
+        int16_t ook_threshold_hi = 0;
+        int16_t ook_threshold_lo = 0;
+
+        int16_t ook_threshold_hi_fm = 0;
+        int16_t ook_threshold_lo_fm = 0;
 
         if (pulse_detect->use_peak_follower) {
-            // pass input sample to the peak follower
-            int16_t ook_threshold = peak_follower_process(pulse_detect->peak_follower, am_n);
+            //
+            // am
+            //
+
+            // pass input sample to the peak follower to estimate high/low thresholds
+            int16_t ook_threshold_high, ook_threshold_low;
+            peak_follower_process(pulse_detect->peak_follower, am_n, &ook_threshold_high, &ook_threshold_low);
+
+            // estimate peak center and amplitude
+            const int16_t ook_amplitude = (ook_threshold_high - ook_threshold_low) / 2;
+            int16_t ook_threshold_center = ook_threshold_low + ook_amplitude;
 
             // if we got zero threshold it means there is no valid signal detected
-            if (!ook_threshold) {
+            if (!ook_threshold_high) {
                 am_n = 0;
             }
 
-            ook_threshold_hi = ook_threshold / 4 + ook_threshold / 6;
-            ook_threshold_lo = ook_threshold / 8 - ook_threshold / 6;
+            // estimate high/low thresholds for peak detection
+            ook_threshold_hi = ook_threshold_center + ook_amplitude / 4;
+            ook_threshold_lo = ook_threshold_center - ook_amplitude / 4;
+
+            //
+            // fm
+            //
+
+            // fm
+            // pass input sample to the peak follower to estimate high/low thresholds
+            int16_t ook_threshold_high_fm, ook_threshold_low_fm;
+            peak_follower_process(pulse_detect->peak_follower_fm, fm_n, &ook_threshold_high_fm, &ook_threshold_low_fm);
+
+            // estimate peak center and amplitude
+            const int16_t ook_amplitude_fm = (ook_threshold_high_fm - ook_threshold_low_fm) / 2;
+            int16_t ook_threshold_center_fm = ook_threshold_low_fm + ook_amplitude_fm;
+
+            // estimate high/low thresholds for peak detection
+            ook_threshold_hi_fm = ook_threshold_center_fm + ook_amplitude_fm / 4;
+            ook_threshold_lo_fm = ook_threshold_center_fm - ook_amplitude_fm / 4;
+
         } else {
             int16_t ook_threshold = (s->ook_low_estimate + s->ook_high_estimate) / 2;
             if (pulse_detect->ook_fixed_high_level != 0) {
@@ -312,14 +343,17 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
                     s->ook_high_estimate = MAX(s->ook_high_estimate, pulse_detect->ook_min_high_level);
                     s->ook_high_estimate = MIN(s->ook_high_estimate, OOK_MAX_HIGH_LEVEL);
                     // Estimate pulse carrier frequency
-                    pulses->fsk_f1_est += fm_data[s->data_counter] / OOK_EST_HIGH_RATIO - pulses->fsk_f1_est / OOK_EST_HIGH_RATIO;
+                    pulses->fsk_f1_est += fm_n / OOK_EST_HIGH_RATIO - pulses->fsk_f1_est / OOK_EST_HIGH_RATIO;
                 }
                 // FSK Demodulation
+                // FSK is demodulated only on high edge of long AM pulses
+                // _____|--------------------------|________
+                //
                 if (pulses->num_pulses == 0) {    // Only during first pulse
                     if (fpdm == FSK_PULSE_DETECT_OLD) {
-                        pulse_detect_fsk_classic(&s->pulse_detect_fsk, fm_data[s->data_counter], fsk_pulses);
+                        pulse_detect_fsk_classic(&s->pulse_detect_fsk, fm_n, fsk_pulses);
                     } else {
-                        pulse_detect_fsk_minmax(&s->pulse_detect_fsk, fm_data[s->data_counter], fsk_pulses);
+                        pulse_detect_fsk_minmax(&s->pulse_detect_fsk, fm_n, fsk_pulses);
                     }
                 }
                 break;
@@ -361,9 +395,9 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
                 // FSK Demodulation (continue during short gap - we might return...)
                 if (pulses->num_pulses == 0) {    // Only during first pulse
                     if (fpdm == FSK_PULSE_DETECT_OLD) {
-                        pulse_detect_fsk_classic(&s->pulse_detect_fsk, fm_data[s->data_counter], fsk_pulses);
+                        pulse_detect_fsk_classic(&s->pulse_detect_fsk, fm_n, fsk_pulses);
                     } else {
-                        pulse_detect_fsk_minmax(&s->pulse_detect_fsk, fm_data[s->data_counter], fsk_pulses);
+                        pulse_detect_fsk_minmax(&s->pulse_detect_fsk, fm_n, fsk_pulses);
                     }
                 }
                 break;
