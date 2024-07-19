@@ -16,7 +16,6 @@
 #include "baseband.h"
 #include "median_filter.h"
 #include "peak_follower.h"
-#include "wav_dumper.h"
 #include "util.h"
 #include "logger.h"
 #include "fatal.h"
@@ -60,13 +59,6 @@ struct pulse_detect {
     peak_follower_t *peak_follower;
     peak_follower_t *peak_follower_fm;
     int use_peak_follower;
-
-    wav_dumper_t *wav_dumper_am_demod;
-    wav_dumper_t *wav_dumper_fm_demod;
-    wav_dumper_t *wav_dumper_am_peak_high;
-    wav_dumper_t *wav_dumper_am_peak_low;
-    wav_dumper_t *wav_dumper_am_decoded;
-    wav_dumper_t *wav_dumper_fm_decoded;
 };
 
 pulse_detect_t *pulse_detect_create(void)
@@ -83,14 +75,6 @@ pulse_detect_t *pulse_detect_create(void)
     pulse_detect->peak_follower = peak_follower_create(0.05, 0.99999, MIN_DB);
     pulse_detect->peak_follower_fm = peak_follower_create(0.05, 0.99999, MIN_DB);
     pulse_detect->use_peak_follower = 1;
-
-    pulse_detect->wav_dumper_am_demod = NULL;
-    pulse_detect->wav_dumper_fm_demod = NULL;
-    pulse_detect->wav_dumper_am_peak_high = NULL;
-    pulse_detect->wav_dumper_am_peak_low = NULL;
-    pulse_detect->wav_dumper_am_decoded = NULL;
-    pulse_detect->wav_dumper_fm_decoded = NULL;
-
     return pulse_detect;
 }
 
@@ -99,13 +83,6 @@ void pulse_detect_free(pulse_detect_t *pulse_detect)
     median_filter_destroy(&(pulse_detect->median_filter));
     peak_follower_destroy(&(pulse_detect->peak_follower));
     peak_follower_destroy(&(pulse_detect->peak_follower_fm));
-
-    wav_dumper_destroy(&(pulse_detect->wav_dumper_am_demod));
-    wav_dumper_destroy(&(pulse_detect->wav_dumper_fm_demod));
-    wav_dumper_destroy(&(pulse_detect->wav_dumper_am_peak_high));
-    wav_dumper_destroy(&(pulse_detect->wav_dumper_am_peak_low));
-    wav_dumper_destroy(&(pulse_detect->wav_dumper_am_decoded));
-    wav_dumper_destroy(&(pulse_detect->wav_dumper_fm_decoded));
     free(pulse_detect);
 }
 
@@ -229,19 +206,6 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
     pulse_detect_t *s = pulse_detect;
     s->ook_high_estimate = MAX(s->ook_high_estimate, pulse_detect->ook_min_high_level);    // Be sure to set initial minimum level
 
-    if (!pulse_detect->wav_dumper_am_demod)
-        pulse_detect->wav_dumper_am_demod = wav_dumper_create("./dump.wav", samp_rate, 4096);
-    if (!pulse_detect->wav_dumper_am_peak_high)
-        pulse_detect->wav_dumper_am_peak_high = wav_dumper_create("./dump_peak_high.wav", samp_rate, 4096);
-    if (!pulse_detect->wav_dumper_am_peak_low)
-        pulse_detect->wav_dumper_am_peak_low = wav_dumper_create("./dump_peak_low.wav", samp_rate, 4096);
-    if (!pulse_detect->wav_dumper_am_decoded)
-        pulse_detect->wav_dumper_am_decoded = wav_dumper_create("./dump_am_decoded.wav", samp_rate, 4096);
-    if (!pulse_detect->wav_dumper_fm_decoded)
-        pulse_detect->wav_dumper_fm_decoded = wav_dumper_create("./dump_fm_decoded.wav", samp_rate, 4096);
-    if (!pulse_detect->wav_dumper_fm_demod)
-        pulse_detect->wav_dumper_fm_demod = wav_dumper_create("./dump_fm.wav", samp_rate, 4096);
-
     if (s->data_counter == 0) {
         // age the pulse_data if this is a fresh buffer
         pulses->start_ago += len;
@@ -253,11 +217,9 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
     while (s->data_counter < len) {
         // apply median filtering to AM demodulated data
         int16_t am_n = median_filter_process(pulse_detect->median_filter, envelope_data[s->data_counter]);
-        wav_dumper_write_sample(pulse_detect->wav_dumper_am_demod, am_n);
 
         // get one FM demodulated sample
         int16_t fm_n = fm_data[s->data_counter];
-        wav_dumper_write_sample(pulse_detect->wav_dumper_fm_demod, fm_n);
 
         // Calculate OOK detection threshold and hysteresis
         if (pulse_detect->verbosity >= LOG_NOTICE) {
@@ -309,40 +271,6 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
             // estimate high/low thresholds for peak detection
             ook_threshold_hi_fm = ook_threshold_center_fm + ook_amplitude_fm / 4;
             ook_threshold_lo_fm = ook_threshold_center_fm - ook_amplitude_fm / 4;
-
-            //
-            // extract digital AM signal using thresholds
-            //
-
-            static int16_t out_am = 0;
-
-            if (ook_threshold_hi) {
-                if (am_n > ook_threshold_hi) {
-                    out_am = 32767;
-                } else if (am_n < ook_threshold_lo) {
-                    out_am = 0;
-                }
-            }
-
-            //
-            // extract digital FM signal using thresholds
-            //
-
-            static int16_t out_fm = 0;
-
-            if (fm_n > ook_threshold_hi_fm) {
-                out_fm = 32767;
-            } else if (fm_n < ook_threshold_lo_fm) {
-                out_fm = 0;
-            }
-
-            // FM signal is only valid when AM envelope is also valid
-            out_fm = out_am ? out_fm : 0;
-
-            wav_dumper_write_sample(pulse_detect->wav_dumper_am_peak_high, ook_threshold_hi_fm);
-            wav_dumper_write_sample(pulse_detect->wav_dumper_am_peak_low, ook_threshold_lo_fm);
-            wav_dumper_write_sample(pulse_detect->wav_dumper_am_decoded, out_am);
-            wav_dumper_write_sample(pulse_detect->wav_dumper_fm_decoded, out_fm);
 
         } else {
             int16_t ook_threshold = (s->ook_low_estimate + s->ook_high_estimate) / 2;
