@@ -14,6 +14,7 @@
 #include "pulse_detect_fsk.h"
 #include "pulse_data.h"
 #include "baseband.h"
+#include "dc_blocker.h"
 #include "median_filter.h"
 #include "peak_follower.h"
 #include "wav_dumper.h"
@@ -29,7 +30,7 @@
 #define OOK_MAX_LOW_LEVEL   DB_TO_AMP(-15) // Maximum estimate for low level
 #define OOK_EST_HIGH_RATIO  64          // Constant for slowness of OOK high level estimator
 #define OOK_EST_LOW_RATIO   1024        // Constant for slowness of OOK low level (noise) estimator (very slow)
-#define MIN_DB              -20         // minimum accepted signal strength in peak follower in dB. If this is set too low, decoder may pick up too much noise which prevents FSK decoder from lock-on
+#define MIN_DB              -25         // minimum accepted signal strength in peak follower in dB. If this is set too low, decoder may pick up too much noise which prevents FSK decoder from lock-on
 
 /// Internal state data for pulse_pulse_package()
 struct pulse_detect {
@@ -56,6 +57,7 @@ struct pulse_detect {
     int verbosity; ///< Debug output verbosity, 0=None, 1=Levels, 2=Histograms
 
     pulse_detect_fsk_t pulse_detect_fsk;
+    dc_blocker_t *dc_blocker;
     median_filter_t *median_filter;
     peak_follower_t *peak_follower;
     peak_follower_t *peak_follower_fm;
@@ -79,6 +81,7 @@ pulse_detect_t *pulse_detect_create(void)
 
     pulse_detect_set_levels(pulse_detect, 0, 0.0, -12.1442, 9.0, 0);
 
+    pulse_detect->dc_blocker = dc_blocker_create(128);
     pulse_detect->median_filter = median_filter_create(15);
     pulse_detect->peak_follower = peak_follower_create(0.05, 0.99999, MIN_DB);
     pulse_detect->peak_follower_fm = peak_follower_create(0.05, 0.99999, MIN_DB);
@@ -96,6 +99,7 @@ pulse_detect_t *pulse_detect_create(void)
 
 void pulse_detect_free(pulse_detect_t *pulse_detect)
 {
+    dc_blocker_destroy(&(pulse_detect->dc_blocker));
     median_filter_destroy(&(pulse_detect->median_filter));
     peak_follower_destroy(&(pulse_detect->peak_follower));
     peak_follower_destroy(&(pulse_detect->peak_follower_fm));
@@ -251,8 +255,16 @@ int pulse_detect_package(pulse_detect_t *pulse_detect, int16_t const *envelope_d
     int eop_on_spurious = 0;
     // Process all new samples
     while (s->data_counter < len) {
-        // apply median filtering to AM demodulated data
+#ifdef USE_DC_FILTER
+        // remove any DC offset from the input signal
+        int16_t filtered_sample = dc_blocker_filter(pulse_detect->dc_blocker, envelope_data[s->data_counter]);
+
+        // apply median filtering
+        int16_t am_n = median_filter_process(pulse_detect->median_filter, filtered_sample);
+#else
+        // apply median filtering
         int16_t am_n = median_filter_process(pulse_detect->median_filter, envelope_data[s->data_counter]);
+#endif
         wav_dumper_write_sample(pulse_detect->wav_dumper_am_demod, am_n);
 
         // get one FM demodulated sample
